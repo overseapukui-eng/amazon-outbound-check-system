@@ -35,6 +35,7 @@
         .progress-row { margin-bottom: 6px; }
         .date-row { margin-top: 10px; display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
         .scanner-name-display { cursor: pointer; color: #0d6efd; text-decoration: underline; font-size: 0.9rem; }
+        .dropdown-menu { min-width: 200px; }
         @media (max-width: 480px) {
             .container { padding: 5px; }
             h4 { font-size: 1.2rem; }
@@ -58,6 +59,7 @@
             .reset-master-btn { font-size: 0.65rem; padding: 0 4px; }
             .card-header .progress-small { width: 60px; }
             .card-header .badge.bg-info { font-size: 0.7rem; }
+            .dropdown-menu { min-width: 160px; }
         }
         .pda-hint { display: none; }
     </style>
@@ -127,13 +129,24 @@
             <div class="progress">
                 <div id="progressBar" class="progress-bar" role="progressbar" style="width: 0%;"></div>
             </div>
+            <!-- 日期行 + 下拉菜单 -->
             <div class="date-row">
                 <span class="date-label" id="startDateLabel">起始日：</span>
                 <input type="date" id="startDate" class="form-control form-control-sm">
                 <span class="date-label">~</span>
                 <span class="date-label" id="endDateLabel">结束日：</span>
                 <input type="date" id="endDate" class="form-control form-control-sm">
-                <button class="btn btn-outline-primary btn-sm btn-export" id="exportBtn">📥 导出</button>
+                
+                <!-- 下拉菜单代替独立按钮 -->
+                <div class="dropdown">
+                    <button class="btn btn-outline-primary btn-sm dropdown-toggle" type="button" id="exportDropdown" data-bs-toggle="dropdown" aria-expanded="false">
+                        📥 导出
+                    </button>
+                    <ul class="dropdown-menu" aria-labelledby="exportDropdown">
+                        <li><a class="dropdown-item" href="#" id="exportChecklist">📋 导出复核清单（含扫描状态）</a></li>
+                        <li><a class="dropdown-item" href="#" id="exportHistory">📜 导出历史记录（所有扫描记录）</a></li>
+                    </ul>
+                </div>
             </div>
         </div>
 
@@ -194,7 +207,6 @@
                 progressLabel: '全局进度',
                 startDateLabel: '起始日：',
                 endDateLabel: '结束日：',
-                exportBtn: '📥 导出',
                 scanInputPlaceholder: '扫描箱标（自动识别）',
                 scanBtn: '手动校验',
                 checklistTitle: '📋 复核清单',
@@ -222,6 +234,8 @@
                 scanned: '已扫',
                 unscanned: '未扫',
                 confirmDelete: '此操作不可撤销！',
+                exportChecklist: '📋 导出复核清单（含扫描状态）',
+                exportHistory: '📜 导出历史记录（所有扫描记录）',
             },
             es: {
                 pageTitle: 'Sistema de Verificación de Envíos',
@@ -236,7 +250,6 @@
                 progressLabel: 'Progreso global',
                 startDateLabel: 'Fecha inicio:',
                 endDateLabel: 'Fecha fin:',
-                exportBtn: '📥 Exportar',
                 scanInputPlaceholder: 'Escanear código (automático)',
                 scanBtn: 'Verificar manual',
                 checklistTitle: '📋 Lista de verificación',
@@ -264,6 +277,8 @@
                 scanned: 'Escaneado',
                 unscanned: 'No escaneado',
                 confirmDelete: '¡Esta acción no se puede deshacer!',
+                exportChecklist: '📋 Exportar lista de verificación (con estado)',
+                exportHistory: '📜 Exportar historial de escaneos',
             }
         };
 
@@ -287,11 +302,13 @@
             document.getElementById('progressLabel').textContent = dict.progressLabel;
             document.getElementById('startDateLabel').textContent = dict.startDateLabel;
             document.getElementById('endDateLabel').textContent = dict.endDateLabel;
-            document.getElementById('exportBtn').textContent = dict.exportBtn;
             document.getElementById('scanInput').placeholder = dict.scanInputPlaceholder;
             document.getElementById('scanBtn').textContent = dict.scanBtn;
             document.getElementById('checklistTitle').textContent = dict.checklistTitle;
             document.getElementById('historyTitle').textContent = dict.historyTitle;
+            // 更新下拉菜单文字（直接修改 innerHTML，因为它们是固定 id）
+            document.getElementById('exportChecklist').innerHTML = dict.exportChecklist;
+            document.getElementById('exportHistory').innerHTML = dict.exportHistory;
 
             document.getElementById('langZh').className = 'lang-btn' + (lang === 'zh' ? ' active' : '');
             document.getElementById('langEs').className = 'lang-btn' + (lang === 'es' ? ' active' : '');
@@ -766,8 +783,8 @@
             badge.textContent = sorted.length;
         }
 
-        // ---------- 导出 Excel ----------
-        function exportExcel() {
+        // ---------- 导出功能（下拉菜单） ----------
+        function exportChecklist() {
             if (!currentRecipient) {
                 alert(LANG[currentLang].scanPleaseSelectRecipient);
                 return;
@@ -780,7 +797,27 @@
             window.location.href = url;
         }
 
-        document.getElementById('exportBtn').addEventListener('click', exportExcel);
+        function exportHistory() {
+            if (!currentRecipient) {
+                alert(LANG[currentLang].scanPleaseSelectRecipient);
+                return;
+            }
+            let url = `/export_history?recipient=${encodeURIComponent(currentRecipient)}`;
+            const sDate = document.getElementById('startDate').value;
+            const eDate = document.getElementById('endDate').value;
+            if (sDate) url += `&start_date=${sDate}`;
+            if (eDate) url += `&end_date=${eDate}`;
+            window.location.href = url;
+        }
+
+        document.getElementById('exportChecklist').addEventListener('click', function(e) {
+            e.preventDefault();
+            exportChecklist();
+        });
+        document.getElementById('exportHistory').addEventListener('click', function(e) {
+            e.preventDefault();
+            exportHistory();
+        });
 
         // 折叠时保持聚焦
         document.querySelectorAll('.collapse-toggle').forEach(el => {
@@ -814,7 +851,6 @@
                         scannedBarcodes.clear();
                         updateScannedList();
                         document.getElementById('scanResult').innerHTML = '';
-                        // 隐藏 PDA 提示
                         const hint = document.getElementById('pdaHint');
                         hint.style.display = 'none';
                     } else {
@@ -823,7 +859,6 @@
                 })
                 .catch(err => {
                     console.error('拉取数据失败', err);
-                    // 在 PDA 提示区域显示错误信息
                     const hint = document.getElementById('pdaHint');
                     hint.style.display = 'block';
                     hint.className = 'alert alert-danger text-center';
