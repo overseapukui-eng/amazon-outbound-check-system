@@ -2,7 +2,7 @@ import os
 import re
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
-from flask import Flask, render_template, request, jsonify, send_file, g
+from flask import Flask, render_template, request, jsonify, send_file
 from werkzeug.utils import secure_filename
 from collections import defaultdict
 from openpyxl import Workbook
@@ -266,7 +266,7 @@ def get_status(recipient):
     scanned = [{'barcode': row['barcode'], 'scanner': row['scanner_name'], 'time': row['scanned_at']} for row in rows]
     return jsonify({'scanned': scanned})
 
-# ========== 原有导出：基于当前清单（含已扫/未扫状态） ==========
+# ========== 导出：复核清单（基于当前清单） ==========
 @app.route('/export', methods=['GET'])
 def export_excel():
     recipient = request.args.get('recipient')
@@ -372,7 +372,7 @@ def export_excel():
                      download_name=f'复核清单_{recipient}_{datetime.now().strftime("%Y%m%d")}.xlsx',
                      mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
 
-# ========== 新增导出：纯历史扫描记录（不依赖清单） ==========
+# ========== 导出：历史记录（所有扫描记录，格式与复核清单一致） ==========
 @app.route('/export_history', methods=['GET'])
 def export_history():
     recipient = request.args.get('recipient')
@@ -413,13 +413,23 @@ def export_history():
 
     wb = Workbook()
     ws = wb.active
-    ws.title = '扫描历史记录'
-    headers = ['收件人', '条码', '扫描员', '扫描时间(墨西哥)']
+    ws.title = '历史记录'   # 与复核清单的 sheet 名称区分
+
+    # 使用与 /export 完全相同的标题
+    headers = ['主码Master', '类型Tipo', '总箱数Veces', '条码Codigo', '扫描状态Estado de escaneo',
+               '箱数Caja', '日期Fecha', '时间Hora', '扫描员Escaneador']
     ws.append(headers)
     for col in range(1, len(headers)+1):
         ws.cell(row=1, column=col).font = Font(bold=True)
 
     for row in rows:
+        # 从条码提取主码
+        barcode = row['barcode']
+        master_code = extract_custom_base_code(barcode)  # 去掉 U+6位数字
+        if not master_code:
+            master_code = barcode
+
+        # 解析时间
         utc_time = row['scanned_at']
         if isinstance(utc_time, str):
             try:
@@ -431,16 +441,28 @@ def export_history():
         if utc_dt.tzinfo is None:
             utc_dt = utc_dt.replace(tzinfo=timezone.utc)
         mexico_dt = utc_dt.astimezone(mexico_tz)
-        fecha_hora = mexico_dt.strftime('%Y-%m-%d %H:%M:%S')
+        fecha = mexico_dt.strftime('%Y-%m-%d')
+        hora = mexico_dt.strftime('%H:%M:%S')
         scanner = row['scanner_name'] or ''
-        ws.append([recipient, row['barcode'], scanner, fecha_hora])
+
+        ws.append([
+            master_code,          # 主码
+            '历史',               # 类型
+            1,                    # 总箱数（每条记录一箱）
+            barcode,              # 条码
+            '已扫/Si',            # 扫描状态
+            1,                    # 箱数
+            fecha,                # 日期
+            hora,                 # 时间
+            scanner               # 扫描员
+        ])
 
     output = io.BytesIO()
     wb.save(output)
     output.seek(0)
     return send_file(output,
                      as_attachment=True,
-                     download_name=f'扫描历史_{recipient}_{datetime.now().strftime("%Y%m%d")}.xlsx',
+                     download_name=f'历史记录_{recipient}_{datetime.now().strftime("%Y%m%d")}.xlsx',
                      mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
 
 @app.route('/reset/<recipient>')
