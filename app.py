@@ -158,7 +158,7 @@ def load_manifest(recipient):
     cur.close()
     conn.close()
     if row:
-        return row['data']   # ← 直接返回 dict，因为 psycopg2 已自动转换
+        return row['data']   # psycopg2 已将 JSONB 自动转换为 dict
     return None
 
 def load_all_recipients():
@@ -266,6 +266,7 @@ def get_status(recipient):
     scanned = [{'barcode': row['barcode'], 'scanner': row['scanner_name'], 'time': row['scanned_at']} for row in rows]
     return jsonify({'scanned': scanned})
 
+# ========== 原有导出：基于当前清单（含已扫/未扫状态） ==========
 @app.route('/export', methods=['GET'])
 def export_excel():
     recipient = request.args.get('recipient')
@@ -369,6 +370,77 @@ def export_excel():
     return send_file(output,
                      as_attachment=True,
                      download_name=f'复核清单_{recipient}_{datetime.now().strftime("%Y%m%d")}.xlsx',
+                     mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+
+# ========== 新增导出：纯历史扫描记录（不依赖清单） ==========
+@app.route('/export_history', methods=['GET'])
+def export_history():
+    recipient = request.args.get('recipient')
+    start_date = request.args.get('start_date')
+    end_date = request.args.get('end_date')
+
+    if not recipient:
+        return jsonify({'error': '缺少收件人参数'}), 400
+
+    mexico_tz = ZoneInfo("America/Mexico_City")
+    utc_start = None
+    utc_end = None
+    if start_date:
+        local_dt = datetime.strptime(start_date, '%Y-%m-%d').replace(tzinfo=mexico_tz)
+        utc_start = local_dt.astimezone(timezone.utc).replace(tzinfo=None)
+    if end_date:
+        local_dt = datetime.strptime(end_date, '%Y-%m-%d').replace(tzinfo=mexico_tz)
+        next_day = local_dt + timedelta(days=1)
+        utc_end = next_day.astimezone(timezone.utc).replace(tzinfo=None)
+
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    query = 'SELECT barcode, scanner_name, scanned_at FROM scan_records WHERE recipient=%s'
+    params = [recipient]
+    if utc_start:
+        query += ' AND scanned_at >= %s'
+        params.append(utc_start.strftime('%Y-%m-%d %H:%M:%S'))
+    if utc_end:
+        query += ' AND scanned_at < %s'
+        params.append(utc_end.strftime('%Y-%m-%d %H:%M:%S'))
+    cur.execute(query, params)
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    if not rows:
+        return jsonify({'error': '该时间段内无扫描记录'}), 404
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = '扫描历史记录'
+    headers = ['收件人', '条码', '扫描员', '扫描时间(墨西哥)']
+    ws.append(headers)
+    for col in range(1, len(headers)+1):
+        ws.cell(row=1, column=col).font = Font(bold=True)
+
+    for row in rows:
+        utc_time = row['scanned_at']
+        if isinstance(utc_time, str):
+            try:
+                utc_dt = datetime.strptime(utc_time, '%Y-%m-%d %H:%M:%S')
+            except ValueError:
+                utc_dt = datetime.fromisoformat(utc_time.replace('Z', '+00:00'))
+        else:
+            utc_dt = utc_time
+        if utc_dt.tzinfo is None:
+            utc_dt = utc_dt.replace(tzinfo=timezone.utc)
+        mexico_dt = utc_dt.astimezone(mexico_tz)
+        fecha_hora = mexico_dt.strftime('%Y-%m-%d %H:%M:%S')
+        scanner = row['scanner_name'] or ''
+        ws.append([recipient, row['barcode'], scanner, fecha_hora])
+
+    output = io.BytesIO()
+    wb.save(output)
+    output.seek(0)
+    return send_file(output,
+                     as_attachment=True,
+                     download_name=f'扫描历史_{recipient}_{datetime.now().strftime("%Y%m%d")}.xlsx',
                      mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
 
 @app.route('/reset/<recipient>')
