@@ -158,7 +158,7 @@ def load_manifest(recipient):
     cur.close()
     conn.close()
     if row:
-        return json.loads(row['data'])
+        return row['data']   # ← 直接返回 dict，因为 psycopg2 已自动转换
     return None
 
 def load_all_recipients():
