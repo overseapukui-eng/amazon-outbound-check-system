@@ -1,6 +1,5 @@
 import os
 import re
-import sqlite3
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from flask import Flask, render_template, request, jsonify, send_file, g
@@ -9,6 +8,9 @@ from collections import defaultdict
 from openpyxl import Workbook
 from openpyxl.styles import Font
 import io
+import psycopg2
+from psycopg2.extras import RealDictCursor
+import json
 
 app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = 'uploads'
@@ -17,42 +19,38 @@ ALLOWED_EXTENSIONS = {'xlsx', 'xls'}
 
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
-# ---------- 数据库 ----------
-DATABASE = 'scan_status.db'
-
-def get_db():
-    db = getattr(g, '_database', None)
-    if db is None:
-        db = g._database = sqlite3.connect(DATABASE)
-        db.row_factory = sqlite3.Row
-    return db
+# ---------- 数据库连接 ----------
+def get_db_connection():
+    database_url = os.environ.get('DATABASE_URL')
+    if not database_url:
+        raise RuntimeError("DATABASE_URL environment variable not set")
+    return psycopg2.connect(database_url, sslmode='require')
 
 def init_db():
-    with app.app_context():
-        db = get_db()
-        db.execute('''
-            CREATE TABLE IF NOT EXISTS scan_records (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                recipient TEXT NOT NULL,
-                barcode TEXT NOT NULL,
-                scanner_name TEXT,
-                scanned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(recipient, barcode)
-            )
-        ''')
-        # 如果 scanner_name 列不存在则添加（兼容旧数据库）
-        try:
-            db.execute('ALTER TABLE scan_records ADD COLUMN scanner_name TEXT')
-        except sqlite3.OperationalError:
-            pass
-        db.execute('CREATE INDEX IF NOT EXISTS idx_recipient ON scan_records (recipient)')
-        db.commit()
-
-@app.teardown_appcontext
-def close_connection(exception):
-    db = getattr(g, '_database', None)
-    if db is not None:
-        db.close()
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS manifests (
+            recipient TEXT PRIMARY KEY,
+            data JSONB NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS scan_records (
+            id SERIAL PRIMARY KEY,
+            recipient TEXT NOT NULL,
+            barcode TEXT NOT NULL,
+            scanner_name TEXT,
+            scanned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(recipient, barcode)
+        )
+    ''')
+    cur.execute('CREATE INDEX IF NOT EXISTS idx_scan_recipient ON scan_records (recipient)')
+    conn.commit()
+    cur.close()
+    conn.close()
 
 # ---------- 辅助函数 ----------
 def allowed_file(filename):
@@ -92,7 +90,7 @@ def parse_excel(file_path):
         data_rows.append({
             'recipient': recipient,
             'fba_id': fba_id,
-            'custom_barcode': custom_barcode
+            'custom_barcode': custom_barcode,
         })
 
     recipients = set()
@@ -104,49 +102,73 @@ def parse_excel(file_path):
     result = {}
     for rec in recipients:
         sub_rows = [r for r in data_rows if r['recipient'] and str(r['recipient']).strip() == rec]
+        count_map = defaultdict(int)
+        type_map = {}
 
-        # FBA
-        fba_list = [r['fba_id'] for r in sub_rows if r['fba_id'] and str(r['fba_id']).strip()]
-        fba_counts = defaultdict(int)
-        for fba in fba_list:
-            fba_counts[str(fba).strip()] += 1
-        fba_items = []
-        for base_code, count in fba_counts.items():
-            serials = generate_serial_list(base_code, count)
-            fba_items.append({
-                'master_code': base_code,
-                'type': 'FBA',
+        for row in sub_rows:
+            # 原逻辑：优先 FBA，若 FBA 为空则使用 Custom
+            code = row['fba_id'] if row['fba_id'] and str(row['fba_id']).strip() else row['custom_barcode']
+            if not code or not str(code).strip():
+                continue
+
+            code_str = str(code).strip()
+            if row['fba_id'] and str(row['fba_id']).strip():
+                master = code_str
+                type_tag = 'FBA'
+            else:
+                master = extract_custom_base_code(code_str)
+                type_tag = 'Custom'
+
+            count_map[master] += 1
+            type_map[master] = type_tag
+
+        items = []
+        for master, count in count_map.items():
+            serials = generate_serial_list(master, count)
+            items.append({
+                'master_code': master,
+                'type': type_map.get(master, 'Unknown'),
                 'total_boxes': count,
                 'serials': serials
             })
 
-        # Custom (FBA为空)
-        empty_fba_rows = [r for r in sub_rows if not r['fba_id'] or str(r['fba_id']).strip() == '']
-        custom_list = [r['custom_barcode'] for r in empty_fba_rows if r['custom_barcode'] and str(r['custom_barcode']).strip()]
-        custom_base_counts = defaultdict(int)
-        for code in custom_list:
-            base = extract_custom_base_code(str(code).strip())
-            custom_base_counts[base] += 1
-        custom_items = []
-        for base_code, count in custom_base_counts.items():
-            serials = generate_serial_list(base_code, count)
-            custom_items.append({
-                'master_code': base_code,
-                'type': 'Custom',
-                'total_boxes': count,
-                'serials': serials
-            })
-
-        result[rec] = {
-            'fba_items': fba_items,
-            'custom_items': custom_items,
-            'all_items': fba_items + custom_items
-        }
+        result[rec] = {'all_items': items}
 
     return result, recipients
 
-# ---------- 全局缓存 ----------
-latest_data = None
+# ---------- 数据库操作 ----------
+def save_manifest(recipient, data):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute('''
+        INSERT INTO manifests (recipient, data, updated_at)
+        VALUES (%s, %s, CURRENT_TIMESTAMP)
+        ON CONFLICT (recipient) DO UPDATE
+        SET data = EXCLUDED.data, updated_at = CURRENT_TIMESTAMP
+    ''', (recipient, json.dumps(data)))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+def load_manifest(recipient):
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute('SELECT data FROM manifests WHERE recipient=%s', (recipient,))
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    if row:
+        return json.loads(row['data'])
+    return None
+
+def load_all_recipients():
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute('SELECT recipient FROM manifests')
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return [row[0] for row in rows]
 
 # ---------- 路由 ----------
 @app.route('/')
@@ -155,7 +177,6 @@ def index():
 
 @app.route('/upload', methods=['POST'])
 def upload_file():
-    global latest_data
     if 'file' not in request.files:
         return jsonify({'error': 'No file part'}), 400
     file = request.files['file']
@@ -170,7 +191,8 @@ def upload_file():
 
     try:
         data, recipients = parse_excel(filepath)
-        latest_data = data
+        for rec, rec_data in data.items():
+            save_manifest(rec, rec_data)
         return jsonify({
             'success': True,
             'recipients': recipients,
@@ -181,14 +203,18 @@ def upload_file():
 
 @app.route('/get_data', methods=['GET'])
 def get_data():
-    global latest_data
-    if latest_data is None:
+    recipients = load_all_recipients()
+    if not recipients:
         return jsonify({'success': False, 'message': '暂无数据，请先上传出库表'}), 404
-    recipients = list(latest_data.keys())
+    data = {}
+    for rec in recipients:
+        manifest = load_manifest(rec)
+        if manifest:
+            data[rec] = manifest
     return jsonify({
         'success': True,
         'recipients': recipients,
-        'data': latest_data
+        'data': data
     })
 
 @app.route('/scan', methods=['POST'])
@@ -202,13 +228,11 @@ def scan_barcode():
     if not scanner_name:
         return jsonify({'error': '请先输入扫描员姓名'}), 400
 
-    global latest_data
-    if latest_data is None:
-        return jsonify({'error': 'No data uploaded'}), 400
-    if recipient not in latest_data:
+    manifest = load_manifest(recipient)
+    if not manifest:
         return jsonify({'error': 'Recipient not found'}), 400
 
-    all_items = latest_data[recipient].get('all_items', [])
+    all_items = manifest.get('all_items', [])
     valid_codes = set()
     for item in all_items:
         for code in item['serials']:
@@ -216,21 +240,29 @@ def scan_barcode():
     if barcode not in valid_codes:
         return jsonify({'match': False, 'message': '无效条码'}), 200
 
-    db = get_db()
-    cur = db.execute('SELECT 1 FROM scan_records WHERE recipient=? AND barcode=?', (recipient, barcode))
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute('SELECT 1 FROM scan_records WHERE recipient=%s AND barcode=%s', (recipient, barcode))
     if cur.fetchone():
+        cur.close()
+        conn.close()
         return jsonify({'match': True, 'already_scanned': True, 'message': '已扫过'}), 200
 
-    db.execute('INSERT INTO scan_records (recipient, barcode, scanner_name) VALUES (?, ?, ?)',
-               (recipient, barcode, scanner_name))
-    db.commit()
+    cur.execute('INSERT INTO scan_records (recipient, barcode, scanner_name) VALUES (%s, %s, %s)',
+                (recipient, barcode, scanner_name))
+    conn.commit()
+    cur.close()
+    conn.close()
     return jsonify({'match': True, 'already_scanned': False, 'message': '扫描成功'}), 200
 
 @app.route('/status/<recipient>')
 def get_status(recipient):
-    db = get_db()
-    cur = db.execute('SELECT barcode, scanner_name, scanned_at FROM scan_records WHERE recipient=?', (recipient,))
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute('SELECT barcode, scanner_name, scanned_at FROM scan_records WHERE recipient=%s', (recipient,))
     rows = cur.fetchall()
+    cur.close()
+    conn.close()
     scanned = [{'barcode': row['barcode'], 'scanner': row['scanner_name'], 'time': row['scanned_at']} for row in rows]
     return jsonify({'scanned': scanned})
 
@@ -243,11 +275,11 @@ def export_excel():
     if not recipient:
         return jsonify({'error': '缺少收件人参数'}), 400
 
-    global latest_data
-    if latest_data is None or recipient not in latest_data:
+    manifest = load_manifest(recipient)
+    if not manifest:
         return jsonify({'error': '收件人数据不存在'}), 404
 
-    items = latest_data[recipient].get('all_items', [])
+    items = manifest.get('all_items', [])
     if not items:
         return jsonify({'error': '无数据可导出'}), 400
 
@@ -262,18 +294,20 @@ def export_excel():
         next_day = local_dt + timedelta(days=1)
         utc_end = next_day.astimezone(timezone.utc).replace(tzinfo=None)
 
-    query = 'SELECT barcode, scanner_name, scanned_at FROM scan_records WHERE recipient=?'
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    query = 'SELECT barcode, scanner_name, scanned_at FROM scan_records WHERE recipient=%s'
     params = [recipient]
     if utc_start:
-        query += ' AND scanned_at >= ?'
-        params.append(utc_start.strftime('%Y-%m-%d %H:%M:%S'))   # 关键修复：统一日期时间格式
+        query += ' AND scanned_at >= %s'
+        params.append(utc_start.strftime('%Y-%m-%d %H:%M:%S'))
     if utc_end:
-        query += ' AND scanned_at < ?'
+        query += ' AND scanned_at < %s'
         params.append(utc_end.strftime('%Y-%m-%d %H:%M:%S'))
-
-    db = get_db()
-    cur = db.execute(query, params)
+    cur.execute(query, params)
     rows = cur.fetchall()
+    cur.close()
+    conn.close()
     scan_info = {}
     for row in rows:
         scan_info[row['barcode']] = {
@@ -339,21 +373,26 @@ def export_excel():
 
 @app.route('/reset/<recipient>')
 def reset_recipient(recipient):
-    db = get_db()
-    db.execute('DELETE FROM scan_records WHERE recipient=?', (recipient,))
-    db.commit()
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute('DELETE FROM scan_records WHERE recipient=%s', (recipient,))
+    conn.commit()
+    cur.close()
+    conn.close()
     return jsonify({'success': True})
 
 @app.route('/reset_master/<recipient>/<master_code>', methods=['POST'])
 def reset_master(recipient, master_code):
-    db = get_db()
-    db.execute('DELETE FROM scan_records WHERE recipient=? AND barcode LIKE ?',
-               (recipient, master_code + 'U%'))
-    db.commit()
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute('DELETE FROM scan_records WHERE recipient=%s AND barcode LIKE %s',
+                (recipient, master_code + 'U%'))
+    conn.commit()
+    cur.close()
+    conn.close()
     return jsonify({'success': True})
 
 if __name__ == '__main__':
     init_db()
-    import os
     port = int(os.environ.get('PORT', 5000))
     app.run(debug=False, host='0.0.0.0', port=port)
