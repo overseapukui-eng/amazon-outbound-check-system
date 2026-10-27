@@ -72,67 +72,116 @@ def generate_serial_list(base_code, count):
 
 def parse_excel_from_workbook(wb):
     sheet = wb['按箱出库'] if '按箱出库' in wb.sheetnames else wb.active
+    header = [str(cell.value).strip() if cell.value else '' for cell in sheet[1]]
 
-    header = [cell.value for cell in sheet[1]]
-    try:
-        recipient_col_idx = header.index('Recipient/收件人') + 1
-        fba_col_idx = header.index('FBA货件ID/FBAShipmentID') + 1
-        custom_col_idx = header.index('Custom box barcode/自定义箱条码') + 1
-    except ValueError as e:
-        raise Exception(f"未找到必要的列: {e}")
+    # 1. 智能识别各列索引（支持新旧不同表头）
+    recipient_idx = None
+    for i, h in enumerate(header):
+        if '收货地址' in h or '收件人' in h or 'Recipient' in h:
+            recipient_idx = i
+            break
+
+    fba_idx = None
+    for i, h in enumerate(header):
+        if '货件号' in h or 'FBA货件ID' in h or 'FBAShipmentID' in h:
+            fba_idx = i
+            break
+
+    custom_idx = None
+    for i, h in enumerate(header):
+        if '自定义箱条码' in h or 'Custom box barcode' in h or '箱唛-入仓号' in h:
+            custom_idx = i
+            break
+
+    box_count_idx = None
+    for i, h in enumerate(header):
+        if '箱数' in h:
+            box_count_idx = i
+            break
+
+    if fba_idx is None and custom_idx is None:
+        raise Exception("未找到必要的列: 既没有找到 '货件号/FBA'，也没有找到 '自定义箱条码/箱唛-入仓号'")
 
     data_rows = []
+    last_fba_code = None
+    last_custom_code = None
+    last_recipient = "默认收件人"
+
     for row in sheet.iter_rows(min_row=2, values_only=True):
-        if all(cell is None for cell in row):
+        # 跳过完全空白的行
+        if all(cell is None or str(cell).strip() == '' for cell in row):
             continue
-        recipient = row[recipient_col_idx - 1] if len(row) >= recipient_col_idx else None
-        fba_id = row[fba_col_idx - 1] if len(row) >= fba_col_idx else None
-        custom_barcode = row[custom_col_idx - 1] if len(row) >= custom_col_idx else None
+
+        # 提取数据
+        recipient = str(row[recipient_idx]).strip() if recipient_idx is not None and len(row) > recipient_idx and row[recipient_idx] else None
+        fba_id = str(row[fba_idx]).strip() if fba_idx is not None and len(row) > fba_idx and row[fba_idx] else None
+        custom_barcode = str(row[custom_idx]).strip() if custom_idx is not None and len(row) > custom_idx and row[custom_idx] else None
+        
+        # 提取箱数 (如果存在且合法)
+        box_count = 1
+        if box_count_idx is not None and len(row) > box_count_idx and row[box_count_idx] is not None:
+            try:
+                box_count = int(float(row[box_count_idx]))
+            except ValueError:
+                box_count = 1
+
+        # 处理合并单元格的继承逻辑：如果为空，则沿用上一行的值
+        if not recipient and last_recipient:
+            recipient = last_recipient
+        elif recipient:
+            last_recipient = recipient
+
+        if not fba_id and last_fba_code:
+            fba_id = last_fba_code
+        elif fba_id:
+            last_fba_code = fba_id
+
+        if not custom_barcode and last_custom_code:
+            custom_barcode = last_custom_code
+        elif custom_barcode:
+            last_custom_code = custom_barcode
+
+        # 判定主码：优先 FBA
+        if fba_id:
+            master_code = fba_id
+            type_tag = 'FBA'
+        elif custom_barcode:
+            master_code = extract_custom_base_code(custom_barcode)
+            type_tag = 'Custom'
+        else:
+            continue
+
         data_rows.append({
             'recipient': recipient,
-            'fba_id': fba_id,
-            'custom_barcode': custom_barcode,
+            'master_code': master_code,
+            'type': type_tag,
+            'box_count': box_count
         })
 
-    recipients = set()
-    for row in data_rows:
-        if row['recipient']:
-            recipients.add(str(row['recipient']).strip())
-    recipients = list(recipients)
+    # 2. 聚合并累加箱数 (处理同一个货件分多行的情况)
+    agg_data = defaultdict(lambda: defaultdict(lambda: {'count': 0, 'type': ''}))
+    for r in data_rows:
+        rec = r['recipient']
+        master = r['master_code']
+        agg_data[rec][master]['count'] += r['box_count']
+        agg_data[rec][master]['type'] = r['type']
 
+    # 3. 生成最终结果
     result = {}
+    recipients = list(agg_data.keys())
+
     for rec in recipients:
-        sub_rows = [r for r in data_rows if r['recipient'] and str(r['recipient']).strip() == rec]
-        count_map = defaultdict(int)
-        type_map = {}
-
-        for row in sub_rows:
-            # 原逻辑：优先 FBA，若 FBA 为空则使用 Custom
-            code = row['fba_id'] if row['fba_id'] and str(row['fba_id']).strip() else row['custom_barcode']
-            if not code or not str(code).strip():
-                continue
-
-            code_str = str(code).strip()
-            if row['fba_id'] and str(row['fba_id']).strip():
-                master = code_str
-                type_tag = 'FBA'
-            else:
-                master = extract_custom_base_code(code_str)
-                type_tag = 'Custom'
-
-            count_map[master] += 1
-            type_map[master] = type_tag
-
         items = []
-        for master, count in count_map.items():
+        for master, info in agg_data[rec].items():
+            count = info['count']
+            t = info['type']
             serials = generate_serial_list(master, count)
             items.append({
                 'master_code': master,
-                'type': type_map.get(master, 'Unknown'),
+                'type': t,
                 'total_boxes': count,
                 'serials': serials
             })
-
         result[rec] = {'all_items': items}
 
     return result, recipients
