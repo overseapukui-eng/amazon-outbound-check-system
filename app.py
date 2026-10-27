@@ -1,11 +1,12 @@
 import os
 import re
+from io import BytesIO
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
-from flask import Flask, render_template, request, jsonify, send_file, g
+from flask import Flask, render_template, request, jsonify, send_file
 from werkzeug.utils import secure_filename
 from collections import defaultdict
-from openpyxl import Workbook
+from openpyxl import load_workbook, Workbook
 from openpyxl.styles import Font
 import io
 import psycopg2
@@ -13,18 +14,20 @@ from psycopg2.extras import RealDictCursor
 import json
 
 app = Flask(__name__)
-app.config['UPLOAD_FOLDER'] = 'uploads'
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
 ALLOWED_EXTENSIONS = {'xlsx', 'xls'}
 
-os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
-
-# ---------- 数据库连接 ----------
+# ---------- 数据库连接（Supabase Transaction Pooler） ----------
 def get_db_connection():
     database_url = os.environ.get('DATABASE_URL')
     if not database_url:
         raise RuntimeError("DATABASE_URL environment variable not set")
-    return psycopg2.connect(database_url, sslmode='require')
+    # Transaction Pooler 不支持预处理语句，禁用 prepare_threshold
+    return psycopg2.connect(
+        database_url,
+        sslmode='require',
+        options='-c prepare_threshold=0'
+    )
 
 def init_db():
     conn = get_db_connection()
@@ -67,9 +70,7 @@ def extract_custom_base_code(code):
 def generate_serial_list(base_code, count):
     return [f"{base_code}U{str(i+1).zfill(6)}" for i in range(count)]
 
-def parse_excel(file_path):
-    from openpyxl import load_workbook
-    wb = load_workbook(file_path, data_only=True)
+def parse_excel_from_workbook(wb):
     sheet = wb['按箱出库'] if '按箱出库' in wb.sheetnames else wb.active
 
     header = [cell.value for cell in sheet[1]]
@@ -158,7 +159,7 @@ def load_manifest(recipient):
     cur.close()
     conn.close()
     if row:
-        return json.loads(row['data'])
+        return row['data']
     return None
 
 def load_all_recipients():
@@ -185,12 +186,11 @@ def upload_file():
     if not allowed_file(file.filename):
         return jsonify({'error': 'File type not allowed'}), 400
 
-    filename = secure_filename(file.filename)
-    filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-    file.save(filepath)
-
     try:
-        data, recipients = parse_excel(filepath)
+        # 内存读取，不落盘（Vercel 文件系统只读）
+        file_bytes = file.read()
+        wb = load_workbook(BytesIO(file_bytes), data_only=True)
+        data, recipients = parse_excel_from_workbook(wb)
         for rec, rec_data in data.items():
             save_manifest(rec, rec_data)
         return jsonify({
@@ -266,6 +266,7 @@ def get_status(recipient):
     scanned = [{'barcode': row['barcode'], 'scanner': row['scanner_name'], 'time': row['scanned_at']} for row in rows]
     return jsonify({'scanned': scanned})
 
+# ========== 导出：复核清单（基于当前清单） ==========
 @app.route('/export', methods=['GET'])
 def export_excel():
     recipient = request.args.get('recipient')
@@ -371,6 +372,96 @@ def export_excel():
                      download_name=f'复核清单_{recipient}_{datetime.now().strftime("%Y%m%d")}.xlsx',
                      mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
 
+# ========== 导出：历史记录（所有扫描记录，格式与复核清单一致） ==========
+@app.route('/export_history', methods=['GET'])
+def export_history():
+    recipient = request.args.get('recipient')
+    start_date = request.args.get('start_date')
+    end_date = request.args.get('end_date')
+
+    if not recipient:
+        return jsonify({'error': '缺少收件人参数'}), 400
+
+    mexico_tz = ZoneInfo("America/Mexico_City")
+    utc_start = None
+    utc_end = None
+    if start_date:
+        local_dt = datetime.strptime(start_date, '%Y-%m-%d').replace(tzinfo=mexico_tz)
+        utc_start = local_dt.astimezone(timezone.utc).replace(tzinfo=None)
+    if end_date:
+        local_dt = datetime.strptime(end_date, '%Y-%m-%d').replace(tzinfo=mexico_tz)
+        next_day = local_dt + timedelta(days=1)
+        utc_end = next_day.astimezone(timezone.utc).replace(tzinfo=None)
+
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    query = 'SELECT barcode, scanner_name, scanned_at FROM scan_records WHERE recipient=%s'
+    params = [recipient]
+    if utc_start:
+        query += ' AND scanned_at >= %s'
+        params.append(utc_start.strftime('%Y-%m-%d %H:%M:%S'))
+    if utc_end:
+        query += ' AND scanned_at < %s'
+        params.append(utc_end.strftime('%Y-%m-%d %H:%M:%S'))
+    cur.execute(query, params)
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    if not rows:
+        return jsonify({'error': '该时间段内无扫描记录'}), 404
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = '历史记录'
+
+    headers = ['主码Master', '类型Tipo', '总箱数Veces', '条码Codigo', '扫描状态Estado de escaneo',
+               '箱数Caja', '日期Fecha', '时间Hora', '扫描员Escaneador']
+    ws.append(headers)
+    for col in range(1, len(headers)+1):
+        ws.cell(row=1, column=col).font = Font(bold=True)
+
+    for row in rows:
+        barcode = row['barcode']
+        master_code = extract_custom_base_code(barcode)
+        if not master_code:
+            master_code = barcode
+
+        utc_time = row['scanned_at']
+        if isinstance(utc_time, str):
+            try:
+                utc_dt = datetime.strptime(utc_time, '%Y-%m-%d %H:%M:%S')
+            except ValueError:
+                utc_dt = datetime.fromisoformat(utc_time.replace('Z', '+00:00'))
+        else:
+            utc_dt = utc_time
+        if utc_dt.tzinfo is None:
+            utc_dt = utc_dt.replace(tzinfo=timezone.utc)
+        mexico_dt = utc_dt.astimezone(mexico_tz)
+        fecha = mexico_dt.strftime('%Y-%m-%d')
+        hora = mexico_dt.strftime('%H:%M:%S')
+        scanner = row['scanner_name'] or ''
+
+        ws.append([
+            master_code,
+            '历史',
+            1,
+            barcode,
+            '已扫/Si',
+            1,
+            fecha,
+            hora,
+            scanner
+        ])
+
+    output = io.BytesIO()
+    wb.save(output)
+    output.seek(0)
+    return send_file(output,
+                     as_attachment=True,
+                     download_name=f'历史记录_{recipient}_{datetime.now().strftime("%Y%m%d")}.xlsx',
+                     mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+
 @app.route('/reset/<recipient>')
 def reset_recipient(recipient):
     conn = get_db_connection()
@@ -392,6 +483,7 @@ def reset_master(recipient, master_code):
     conn.close()
     return jsonify({'success': True})
 
+# Vercel 需要这个入口（本地运行时也保留）
 if __name__ == '__main__':
     init_db()
     port = int(os.environ.get('PORT', 5000))
