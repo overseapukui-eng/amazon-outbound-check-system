@@ -533,7 +533,13 @@ def reset_master(recipient, master_code):
     return jsonify({'success': True})
 
 # Vercel 需要这个入口（本地运行时也保留）
-if __name__ == '__main__':
+# ---- Vercel 启动时自动建表 ----
+try:
     init_db()
+    print("数据库表初始化成功")
+except Exception as e:
+    print(f"数据库表初始化失败，请检查 DATABASE_URL: {e}")
+
+if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(debug=False, host='0.0.0.0', port=port)
